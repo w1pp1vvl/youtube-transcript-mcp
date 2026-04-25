@@ -124,3 +124,36 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`YouTube Transcript MCP server running on port ${PORT}`);
 });
+
+// REST API endpoint (direct, no MCP protocol needed)
+app.get("/transcript/:videoId", async (req, res) => {
+  try {
+    const { videoId } = req.params;
+    const lang = req.query.lang || undefined;
+    const config = {};
+    if (lang) config.lang = lang;
+
+    const transcript = await YoutubeTranscript.fetchTranscript(videoId, config);
+
+    if (!transcript || transcript.length === 0) {
+      return res.status(404).json({ error: "No transcript available" });
+    }
+
+    const text = transcript
+      .map((entry) => {
+        const mins = Math.floor(entry.offset / 60000);
+        const secs = Math.floor((entry.offset % 60000) / 1000);
+        const ts = `${String(mins).padStart(2, "0")}:${String(secs).padStart(2, "0")}`;
+        return `[${ts}] ${entry.text}`;
+      })
+      .join("\n");
+
+    res.json({
+      videoId,
+      segments: transcript.length,
+      text,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
