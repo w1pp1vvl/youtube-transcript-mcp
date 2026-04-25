@@ -59,6 +59,7 @@ async function downloadAudio(videoId) {
       "yt-dlp",
       [
         "--no-check-certificates",
+        "--js-runtimes", "node",
         "-x",
         "--audio-format", "mp3",
         "--audio-quality", "5",
