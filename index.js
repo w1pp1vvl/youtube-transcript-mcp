@@ -8,12 +8,35 @@ import { promisify } from "util";
 import fs from "fs/promises";
 import path from "path";
 import os from "os";
+import { z } from "zod";
 
 const execFileAsync = promisify(execFile);
 const app = express();
 app.use(express.json());
 
 const transports = {};
+
+// Ошибка в одном запросе не должна ронять весь сервер
+process.on("unhandledRejection", (err) => console.error("unhandledRejection:", err));
+process.on("uncaughtException", (err) => console.error("uncaughtException:", err));
+
+// --- Защита от капчи YouTube: запросы строго по одному, с паузой, плюс кэш ---
+const MIN_GAP_MS = Number(process.env.YT_MIN_GAP_MS || 8000);
+let queue = Promise.resolve();
+let lastCallAt = 0;
+function serialized(fn) {
+  const run = queue.then(async () => {
+    const wait = lastCallAt + MIN_GAP_MS - Date.now();
+    if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+    try { return await fn(); } finally { lastCallAt = Date.now(); }
+  });
+  queue = run.catch(() => {});
+  return run;
+}
+const cache = new Map();
+const CACHE_MAX = 300;
+
+class RateLimitedError extends Error {}
 
 // --- Audio transcription via Deepgram ---
 async function transcribeWithDeepgram(audioPath, lang) {
@@ -110,6 +133,15 @@ function formatDeepgramTranscript(dgResponse) {
 
 // --- Core transcript function with fallback ---
 async function getTranscript(videoId, lang) {
+  const key = `${videoId}:${lang || ""}`;
+  if (cache.has(key)) return { ...cache.get(key), cached: true };
+  const result = await serialized(() => fetchTranscriptRaw(videoId, lang));
+  if (cache.size >= CACHE_MAX) cache.delete(cache.keys().next().value);
+  cache.set(key, result);
+  return result;
+}
+
+async function fetchTranscriptRaw(videoId, lang) {
   // Try subtitles first
   try {
     const config = {};
@@ -130,6 +162,10 @@ async function getTranscript(videoId, lang) {
     }
   } catch (err) {
     console.log(`Subtitles not available for ${videoId}: ${err.message}`);
+    // Капча на адресе: запасной путь через yt-dlp упрётся в то же и усугубит блок
+    if (/too many requests|captcha/i.test(err.message)) {
+      throw new RateLimitedError("YouTube rate-limited this server IP (captcha). Retry later.");
+    }
   }
 
   // Fallback: download audio + Deepgram
@@ -168,8 +204,8 @@ const createServer = () => {
     "get_transcript",
     "Extract transcript from a YouTube video. Falls back to audio speech-to-text via Deepgram if subtitles are disabled.",
     {
-      url: { type: "string", description: "YouTube video URL (any format)" },
-      language: { type: "string", description: "Language code (e.g. 'ru', 'en'). Optional." },
+      url: z.string().describe("YouTube video URL (any format)"),
+      language: z.string().optional().describe("Language code (e.g. 'ru', 'en'). Optional."),
     },
     async ({ url, language }) => {
       try {
@@ -210,15 +246,20 @@ function extractVideoId(url) {
 
 // MCP endpoint
 app.post("/mcp", async (req, res) => {
-  const sessionId = req.headers["mcp-session-id"] || randomUUID();
-  let transport = transports[sessionId];
-  if (!transport) {
-    transport = new StreamableHTTPServerTransport({ sessionIdGenerator: () => sessionId });
-    transports[sessionId] = transport;
-    const server = createServer();
-    await server.connect(transport);
+  try {
+    const sessionId = req.headers["mcp-session-id"] || randomUUID();
+    let transport = transports[sessionId];
+    if (!transport) {
+      transport = new StreamableHTTPServerTransport({ sessionIdGenerator: () => sessionId });
+      const server = createServer();
+      await server.connect(transport);
+      transports[sessionId] = transport;
+    }
+    await transport.handleRequest(req, res, req.body);
+  } catch (err) {
+    console.error("MCP handler error:", err);
+    if (!res.headersSent) res.status(500).json({ error: err.message });
   }
-  await transport.handleRequest(req, res, req.body);
 });
 
 app.get("/mcp", async (req, res) => {
@@ -255,7 +296,8 @@ app.get("/transcript/:videoId", async (req, res) => {
     const result = await getTranscript(videoId, lang);
     res.json(result);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    const status = err instanceof RateLimitedError ? 429 : 500;
+    res.status(status).json({ error: err.message, rateLimited: status === 429 });
   }
 });
 
